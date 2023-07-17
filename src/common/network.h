@@ -12,6 +12,11 @@ namespace network {
         int socket_fd;
     } Connection;
 
+    // Configure socket timeout
+    int configure_socket(int socket_fd);
+
+    int configure_blocking(int socket_fd, bool blocking);
+
     // Create, configure and bind a listening socket following the given network config
     int listen(config::ConnectionConfig config);
 
@@ -26,7 +31,6 @@ namespace network {
 
     // Send message to the target connection
     int send_message(int connection_fd, char* buffer, int length);
-    int send_message(int connection_fd, const std::string &message);
 
     // Close connection
     int close(int connection_fd);

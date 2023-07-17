@@ -1,9 +1,11 @@
 #include<iostream>
 #include<cstring>
 
+#include<fcntl.h>
 #include<unistd.h>
 #include<arpa/inet.h>
 #include<sys/socket.h>
+#include<sys/types.h>
 
 #include "config.h"
 #include "error.h"
@@ -11,12 +13,40 @@
 #include "network.h"
 
 namespace network {
+    int configure_socket(int socket_fd) {
+        // Configure socket to non-blocking mode
+        int flags = fcntl(socket_fd, F_GETFL, 0);
+        if (fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            error::error("Failed to configure socket to non-blocking mode!");
+            return -1;
+        }
+
+        // Configure receiving timeout
+        if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &config::TCP_RECEIVE_TIMEOUT, sizeof(config::TCP_RECEIVE_TIMEOUT)) < 0) {
+            error::error("Failed to configure socket receive timeout!");
+            return -1;
+        }
+
+        // Configure sending timeout
+        if (setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &config::TCP_SEND_TIMEOUT, sizeof(config::TCP_SEND_TIMEOUT)) < 0) {
+            error::error("Failed to configure socket send timeout!");
+            return -1;
+        }
+
+        return 0;
+    }
+
     // Create, configure and bind a listening socket following the given network config
     int listen(config::ConnectionConfig config) {
         // Create an IPv4 TCP socket
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd < 0) { // Check if a file descriptor was allocated
             error::critical_error("Failed to create socket!");
+            return -1;
+        }
+
+        // Configure socket timeout & blocking mode
+        if (configure_socket(socket_fd) != 0) {
             return -1;
         }
 
@@ -52,6 +82,11 @@ namespace network {
             return -1;
         }
 
+        // Configure socket timeout & blocking mode
+        if (configure_socket(socket_fd) != 0) {
+            return -1;
+        }
+
         // Build socket address for connection
         struct sockaddr_in server_address{};
         std::memset(&server_address, 0, sizeof(server_address)); // Ensure no garbage is present
@@ -81,7 +116,18 @@ namespace network {
         // Accept next available connection (blocking)
         int conn_fd = ::accept(listener_fd, reinterpret_cast<sockaddr *>(&new_conn.client_address), &addr_len);
         if (conn_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                new_conn.socket_fd = -2;
+                return new_conn;
+            }
+
             error::critical_error("Failed to accept connection!");
+            new_conn.socket_fd = -1;
+            return new_conn;
+        }
+
+        // Configure socket timeout & blocking mode
+        if (configure_socket(conn_fd) != 0) {
             new_conn.socket_fd = -1;
             return new_conn;
         }
@@ -96,6 +142,10 @@ namespace network {
         ssize_t received = recv(connection_fd, buffer, config::MAX_MESSAGE_SIZE, 0);
 
         if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -2;
+            }
+
             error::critical_error("Receive error!");
             return -1;
         }
@@ -113,29 +163,15 @@ namespace network {
         ssize_t sent = send(connection_fd, buffer, length, 0);
 
         if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -2;
+            }
+
             error::critical_error("Send error!");
             return -1;
         }
 
         return (int) sent;
-    }
-
-    // Send message to the target connection
-    int send_message(int connection_fd, const std::string &message) {
-        const char *msg_cstr = message.c_str();
-        for (size_t idx = 0; idx < message.size(); idx += config::MAX_MESSAGE_SIZE) {
-            size_t data_length = std::min((size_t) message.size() - idx, (size_t) config::MAX_MESSAGE_SIZE);
-
-            ssize_t sent = send(connection_fd, msg_cstr + idx, data_length, 0);
-
-            if (sent < 0) {
-                error::critical_error("Send error!");
-                return -1;
-            }
-
-        }
-
-        return (int) message.size();
     }
 
     // Close connection
