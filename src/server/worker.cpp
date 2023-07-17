@@ -1,5 +1,6 @@
 #include<iostream>
 #include<thread>
+#include<map>
 #include<mutex>
 #include<memory>
 #include<iomanip>
@@ -83,8 +84,12 @@ namespace worker::server {
         // Client number for nickname generation
         int client_number = 0;
 
+        // Client threads (for later joining)
+        std::map<std::string, std::thread> threads;
+
         // While the application should be alive, accept new clients
         while (!state->kill) {
+
             // Try accepting a new client
             std::shared_ptr<Client> client_ptr = accept_client(state, ++client_number);
 
@@ -95,11 +100,30 @@ namespace worker::server {
                 break;
             }
 
+            std::cout << "New client from " << client_ptr->ip_str << " assigned nickname " << client_ptr->nickname
+                      << std::endl;
+
             // We have a new connection, register it to the clients map. Here we do guarded access to the map to avoid
             // any concurrency issues. The guard is destroyed after leaving the context, releasing the lock.
             {
                 auto guard = std::lock_guard<std::mutex>(state->clients_mutex);
                 state->clients[client_ptr->nickname] = client_ptr;
+
+                // Cleanup dead clients
+                auto it = state->clients.begin();
+                while (it != state->clients.end()) {
+                    if (it->second->alive) {
+                        it++;
+                        continue;
+                    }
+
+                    // Detach thread to avoid a thread leak
+                    threads[it->first].detach();
+                    threads.erase(it->first);
+
+                    // Remove client from tracking list
+                    it = state->clients.erase(it);
+                }
             }
 
             // Here we can do one of two strategies: create a new thread for each client or have a separate thread
@@ -109,14 +133,20 @@ namespace worker::server {
             // each connections' thread alongside a message queue with the pending messages for that client. That way
             // there is no chance of sync issues for the client.
             // Maybe event keep a simple message index alongside a global message history?
-            std::thread communicator_thread(communicator, client_ptr, state);
-            communicator_thread.detach();
+            threads.emplace(client_ptr->nickname, std::thread(communicator, client_ptr, state));
         }
 
         // The only we should reach here is if a kill signal was received, but let's ensure it anyway to prevent future
         // bugs.
         if (!state->kill) {
-            state->kill = false;
+            state->kill = true;
+        }
+
+        // Wait for each communicator thread to die :)
+        for (auto &entry: threads) {
+            if (entry.second.joinable()) {
+                entry.second.join();
+            }
         }
     }
 
@@ -155,7 +185,6 @@ namespace worker::server {
 
     bool communicator_outgoing(std::shared_ptr<Client> client_ptr, State *state) {
         while (!state->kill && client_ptr->alive && !client_ptr->message_queue.empty()) {
-            // Get top message
             std::shared_ptr<std::string> message = client_ptr->message_queue.front();
 
             // Send direct response to client
@@ -170,6 +199,14 @@ namespace worker::server {
 
                 // Delay
                 std::this_thread::sleep_for(config::POLLING_INTERVAL);
+            }
+
+            // Remove message from the queue
+            {
+                // Acquire message queue lock
+                auto guard = std::lock_guard<std::mutex>(client_ptr->message_queue_mutex);
+                // Pop front message
+                client_ptr->message_queue.pop();
             }
         }
         return false;
@@ -192,8 +229,9 @@ namespace worker::server {
             return true;
         }
 
-        // Check for a closed connection
+        // Check for a closed connection from the client
         if (result == 0) {
+            error::warning("The client with nickname " + client_ptr->nickname + " has ended its connection!");
             client_ptr->alive = false;
             return true;
         }
@@ -247,7 +285,7 @@ namespace worker::server {
         return false;
     }
 
-    void handle_message(const std::string &message, std::shared_ptr<Client> client_ptr, State* state) {
+    void handle_message(const std::string &message, std::shared_ptr<Client> client_ptr, State *state) {
         // Check if it's a normal message, if it is, concatenate the client nickname and broadcast it
         if (message[0] != '/') {
             // Size of the nickname prefix
@@ -276,22 +314,21 @@ namespace worker::server {
             return;
         }
 
-        // Response stream
-        std::stringstream response_ss;
+        // Command response text
+        std::string response = "unknown command";
 
         // Connect command
         if (message == "/connect") {
-            response_ss << "already connected";
+            response = "already connected";
         }
 
         // Ping command
         if (message == "/ping") {
-            response_ss << "pong";
+            response = "pong";
         }
 
         // Send direct response to client
         std::pair<const std::shared_ptr<Client>, int> client_info = std::make_pair(client_ptr, 0);
-        std::string response = response_ss.str();
 
         // Try sending message until max tries reached
         while (try_send_message(response, client_info)) {
@@ -305,23 +342,19 @@ namespace worker::server {
         // receive it.
         std::shared_ptr<std::string> message_ptr = std::make_shared<std::string>(message);
 
-        // Uses clients mutex lock to ensure only one thread is adding messages at each time and all clients receive
-        // the messages in the same order.
-        {
-            // Acquire lock
-            auto guard = std::lock_guard<std::mutex>(state->clients_mutex);
+        for (const auto &entry: state->clients) {
+            // Skip dead clients
+            if (!entry.second->alive) {
+                continue;
+            }
 
-            for(const auto &entry: state->clients) {
-                // Skip dead clients
-                if (!entry.second->alive) {
-                    continue;
-                }
-
+            // Prevent concurrent access to the message queue
+            {
+                // Acquire message queue lock
+                auto guard = std::lock_guard<std::mutex>(entry.second->message_queue_mutex);
                 // Add message to the queue
                 entry.second->message_queue.push(message_ptr);
             }
         }
     }
-
-
 }

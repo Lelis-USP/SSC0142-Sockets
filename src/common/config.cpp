@@ -2,7 +2,7 @@
 #include "config.h"
 
 namespace config {
-    ConnectionConfig parse_config(int argc, char* argv[]) {
+    ConnectionConfig parse_config(int argc, char *argv[]) {
         ConnectionConfig config = {DEFAULT_HOST, DEFAULT_PORT};
 
         // Parse port from the CLI args

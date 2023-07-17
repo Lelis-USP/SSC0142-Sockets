@@ -24,7 +24,7 @@ static void sig_handler(int sig) {
 int main(int argc, char *argv[]) {
     // Register signal handler
     if (std::signal(SIGINT, sig_handler) == SIG_ERR) {
-        error::critical_error("Failed to register signal handler");
+        error::error("Failed to register signal handler");
         return 1;
     }
 
@@ -35,11 +35,21 @@ int main(int argc, char *argv[]) {
     int socket_fd = network::listen(config);
     state.socket_fd = socket_fd;
 
+    if (socket_fd == -1) {
+        std::cout << "Failed to bind address" << std::endl;
+        return 1;
+    }
+
     // Initiate manager thread and join it
     std::thread manager_thread(worker::server::manager, &state);
     manager_thread.join();
 
-    std::cout << "Server interrupted" << std::endl;
+    // Release socket
+    if (state.socket_fd != -1) {
+        close(state.socket_fd);
+    }
+
+    std::cout << "\r\nServer interrupted" << std::endl;
 
     return 0;
 }
