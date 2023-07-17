@@ -32,6 +32,12 @@ namespace worker::server {
 
     void communicator(std::shared_ptr<Client> client_ptr, State* state);
 
+    bool communicator_outgoing(std::shared_ptr<Client> client_ptr, State *state);
+
+    bool communicator_incoming(std::shared_ptr<Client> client_ptr, State *state, char buffer[]);
+
+    bool try_send_message(const std::string &message, std::pair<const std::shared_ptr<Client>, int> &client_info);
+
     void handle_message(const std::string &message, std::shared_ptr<Client> client_ptr, State* state);
 
     void broadcast_message(const std::string &message, State *state);

@@ -6,7 +6,6 @@
 #include<set>
 
 #include "../common/error.h"
-#include "../common/worker.h"
 
 #include "worker.h"
 
@@ -110,8 +109,8 @@ namespace worker::server {
             // each connections' thread alongside a message queue with the pending messages for that client. That way
             // there is no chance of sync issues for the client.
             // Maybe event keep a simple message index alongside a global message history?
-            std::thread listener_thread(communicator, client_ptr, state);
-            listener_thread.detach();
+            std::thread communicator_thread(communicator, client_ptr, state);
+            communicator_thread.detach();
         }
 
         // The only we should reach here is if a kill signal was received, but let's ensure it anyway to prevent future
@@ -129,35 +128,15 @@ namespace worker::server {
 
         // Check for new messages from the client while the application and client are alive
         while (!state->kill && client_ptr->alive) {
-            // Try reading the next message from the client in a non-blocking way. If there is no message available, or
-            // a timeout is triggered, a EAGAIN or EWOULDBLOCK error will happen, resulting in a -2 return.
-            int result = network::read_message(client_ptr->connection.socket_fd, buffer);
-
-            // If there is no available message or something wrong happened, try again after a small delay
-            if (result == -2) {
-                std::this_thread::sleep_for(config::POLLING_INTERVAL);
-                continue;
-            }
-
-            // Check for a likely unrecoverable error, if present, end this connection
-            if (result == -1) {
-                client_ptr->alive = false;
+            // Send pending messages on the queue
+            if (communicator_outgoing(client_ptr, state)) {
                 break;
             }
 
-            // Check for a closed connection
-            if (result == 0) {
-                client_ptr->alive = false;
+            // Read new command, if available
+            if (communicator_incoming(client_ptr, state, buffer)) {
                 break;
             }
-
-            // We have successfully received a message, result holds the actual message length, so we can build the
-            // string by null-terminating it.
-            buffer[result] = '\0';
-            std::string message = buffer;
-
-            // Do something with the message, not my problem...
-            handle_message(message, client_ptr, state);
         }
 
         // There is only two scenarios here: either our connection is dead or the application is being killed
@@ -174,22 +153,59 @@ namespace worker::server {
         // Exit :)
     }
 
+    bool communicator_outgoing(std::shared_ptr<Client> client_ptr, State *state) {
+        while (!state->kill && client_ptr->alive && !client_ptr->message_queue.empty()) {
+            // Get top message
+            std::shared_ptr<std::string> message = client_ptr->message_queue.front();
 
-    std::unordered_map<std::shared_ptr<Client>, int> get_pending_clients(State *state) {
-        // Create a map of pointers, holding the number of failures whilst trying to send the message to each client
-        std::unordered_map<std::shared_ptr<Client>, int> pending_clients;
+            // Send direct response to client
+            std::pair<const std::shared_ptr<Client>, int> client_info = std::make_pair(client_ptr, 0);
 
-        // Iterate over each connection and add it to our pending clients set. Keep track of the concurrency mutex to
-        // avoid any modification to our map while building the set.
-        auto guard = std::lock_guard<std::mutex>(state->clients_mutex);
-        for (const auto &entry: state->clients) {
-            if (!entry.second->alive) {
-                continue;
+            // Try sending message until max tries reached
+            while (try_send_message(*message, client_info)) {
+                // Should be dead, skip
+                if (state->kill || !client_ptr->alive) {
+                    return true;
+                }
+
+                // Delay
+                std::this_thread::sleep_for(config::POLLING_INTERVAL);
             }
-            pending_clients[entry.second] = 0;
+        }
+        return false;
+    }
+
+    bool communicator_incoming(std::shared_ptr<Client> client_ptr, State *state, char buffer[]) {
+        // Try reading the next message from the client in a non-blocking way. If there is no message available, or
+        // a timeout is triggered, a EAGAIN or EWOULDBLOCK error will happen, resulting in a -2 return.
+        int result = network::read_message(client_ptr->connection.socket_fd, buffer);
+
+        // If there is no available message or something wrong happened, try again after a small delay
+        if (result == -2) {
+            std::this_thread::sleep_for(config::POLLING_INTERVAL);
+            return false;
         }
 
-        return pending_clients;
+        // Check for a likely unrecoverable error, if present, end this connection
+        if (result == -1) {
+            client_ptr->alive = false;
+            return true;
+        }
+
+        // Check for a closed connection
+        if (result == 0) {
+            client_ptr->alive = false;
+            return true;
+        }
+
+        // We have successfully received a message, result holds the actual message length, so we can build the
+        // string by null-terminating it.
+        buffer[result] = '\0';
+        std::string message = buffer;
+
+        // Do something with the message, not my problem...
+        handle_message(message, client_ptr, state);
+        return false;
     }
 
     bool try_send_message(const std::string &message, std::pair<const std::shared_ptr<Client>, int> &client_info) {
@@ -218,8 +234,11 @@ namespace worker::server {
             return true;
         }
 
+        // Likely unrecoverable error, abort already
         if (result == -1) {
             error::error("Failed to send a message");
+            client_info.first->alive = false;
+
             // No retry needed
             return false;
         }
@@ -231,14 +250,23 @@ namespace worker::server {
     void handle_message(const std::string &message, std::shared_ptr<Client> client_ptr, State* state) {
         // Check if it's a normal message, if it is, concatenate the client nickname and broadcast it
         if (message[0] != '/') {
-            // TODO: fix truncation of message
+            // Size of the nickname prefix
+            size_t prefix_len = client_ptr->nickname.size() + 2;
 
-            // Add author's nickname to message
-            std::stringstream new_message;
-            new_message << client_ptr->nickname << ": " << message;
+            if (message.size() + prefix_len <= config::MAX_MESSAGE_SIZE) {
+                // Broadcast message to every client
+                broadcast_message(client_ptr->nickname + ": " + message, state);
+            } else {
+                // Split the message into two
+                size_t cut_idx = config::MAX_MESSAGE_SIZE - prefix_len;
+                std::string left_str = client_ptr->nickname + ": " + message.substr(0, cut_idx);
+                std::string right_str = client_ptr->nickname + ": " + message.substr(cut_idx, message.size());
 
-            // Broadcast message to every client
-            broadcast_message(new_message.str(), state);
+                // Send both messages
+                broadcast_message(left_str, state);
+                broadcast_message(right_str, state);
+            }
+
             return;
         }
 
@@ -273,28 +301,25 @@ namespace worker::server {
 
 
     void broadcast_message(const std::string &message, State *state) {
-        auto pending_clients = get_pending_clients(state);
+        // Build a shared pointer to a copy of the message to avoid duplicating the message for each client which will
+        // receive it.
+        std::shared_ptr<std::string> message_ptr = std::make_shared<std::string>(message);
 
-        // Try sending the messages to each of the alive clients, unless a kill is requested
-        while (!state->kill && !pending_clients.empty()) {
-            // Iterate over each client
-            auto it = pending_clients.begin();
-            while (it != pending_clients.end()) {
-                // Kill signal, just stop all the chaos
-                if (state->kill) {
-                    break;
+        // Uses clients mutex lock to ensure only one thread is adding messages at each time and all clients receive
+        // the messages in the same order.
+        {
+            // Acquire lock
+            auto guard = std::lock_guard<std::mutex>(state->clients_mutex);
+
+            for(const auto &entry: state->clients) {
+                // Skip dead clients
+                if (!entry.second->alive) {
+                    continue;
                 }
 
-                if (try_send_message(message, *it)) {
-                    // The message delivery timed out and should still be retried
-                    it++;
-                } else {
-                    // The message shouldn't be retried anymore, it either failed or was successfully sent
-                    it = pending_clients.erase(it);
-                }
+                // Add message to the queue
+                entry.second->message_queue.push(message_ptr);
             }
-
-            std::this_thread::sleep_for(config::POLLING_INTERVAL);
         }
     }
 
