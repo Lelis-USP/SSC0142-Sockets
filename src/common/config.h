@@ -36,5 +36,5 @@ namespace config {
         bool blocking;
     };
 
-    ConnectionConfig parse_config(int argc, char* argv[]);
+    ConnectionConfig parse_config(int argc, char *argv[]);
 }

@@ -22,13 +22,15 @@ namespace network {
         }
 
         // Configure receiving timeout
-        if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &config::TCP_RECEIVE_TIMEOUT, sizeof(config::TCP_RECEIVE_TIMEOUT)) < 0) {
+        if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &config::TCP_RECEIVE_TIMEOUT,
+                       sizeof(config::TCP_RECEIVE_TIMEOUT)) < 0) {
             error::error("Failed to configure socket receive timeout!");
             return -1;
         }
 
         // Configure sending timeout
-        if (setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &config::TCP_SEND_TIMEOUT, sizeof(config::TCP_SEND_TIMEOUT)) < 0) {
+        if (setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &config::TCP_SEND_TIMEOUT,
+                       sizeof(config::TCP_SEND_TIMEOUT)) < 0) {
             error::error("Failed to configure socket send timeout!");
             return -1;
         }
@@ -41,7 +43,7 @@ namespace network {
         // Create an IPv4 TCP socket
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd < 0) { // Check if a file descriptor was allocated
-            error::critical_error("Failed to create socket!");
+            error::error("Failed to create socket!");
             return -1;
         }
 
@@ -59,13 +61,13 @@ namespace network {
 
         // Bind socket to the configured address
         if (bind(socket_fd, reinterpret_cast<const sockaddr *>(&listen_address), sizeof(listen_address)) < 0) {
-            error::critical_error("Failed to bind socket!");
+            error::error("Failed to bind socket!");
             return -1;
         }
 
         // Listen on the created socket, with a limit of 63 pending connections
         if (::listen(socket_fd, 63) < 0) {
-            error::critical_error("Failed to listen on socket!");
+            error::error("Failed to listen on socket!");
             return -1;
         }
 
@@ -78,12 +80,6 @@ namespace network {
         // Create an IPv4 TCP socket
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd < 0) { // Check if a file descriptor was allocated
-            error::critical_error("Failed to create socket!");
-            return -1;
-        }
-
-        // Configure socket timeout & blocking mode
-        if (configure_socket(socket_fd) != 0) {
             return -1;
         }
 
@@ -96,11 +92,15 @@ namespace network {
 
         // Connect to the given client
         if (::connect(socket_fd, reinterpret_cast<const sockaddr *>(&server_address), sizeof(server_address)) < 0) {
-            error::critical_error("Failed to connect socket!");
             return -1;
         }
 
-        std::cout << "Connected to " << config.host << ":" << config.port << std::endl;
+        // Configure socket timeout & blocking mode. Executing after the connect prevents handling async connect and the
+        // errno EINPROGRESS.
+        if (configure_socket(socket_fd) != 0) {
+            return -1;
+        }
+
         return socket_fd;
     }
 
@@ -121,7 +121,7 @@ namespace network {
                 return new_conn;
             }
 
-            error::critical_error("Failed to accept connection!");
+            error::error("Failed to accept connection!");
             new_conn.socket_fd = -1;
             return new_conn;
         }
@@ -146,13 +146,8 @@ namespace network {
                 return -2;
             }
 
-            error::critical_error("Receive error!");
+            error::error("Receive error!");
             return -1;
-        }
-
-        if (received == 0) {
-            error::warning("Received zero bytes, connection probably closed!");
-            return 0;
         }
 
         return (int) received;
@@ -167,7 +162,7 @@ namespace network {
                 return -2;
             }
 
-            error::critical_error("Send error!");
+            error::error("Send error!");
             return -1;
         }
 
@@ -178,7 +173,7 @@ namespace network {
     int close(int connection_fd) {
         int status = ::close(connection_fd);
         if (status == -1) {
-            error::critical_error("Failed to close socket!");
+            error::error("Failed to close socket!");
             return -1;
         }
 

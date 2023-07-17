@@ -11,11 +11,11 @@ file(GLOB_RECURSE COMMON_FILES "src/common/*.cpp" "src/common/*.c" "src/common/*
 add_library(common ${COMMON_FILES})
 target_include_directories(common PUBLIC src/common)
 
-## Add client files
-#file(GLOB_RECURSE CLIENT_FILES "src/client/*.cpp" "src/client/*.c" "src/client/*.h" "src/client/*.hpp")
-#add_executable(client ${CLIENT_FILES})
-#target_link_libraries(client common)
-#target_include_directories(client PUBLIC src/client)
+# Add client files
+file(GLOB_RECURSE CLIENT_FILES "src/client/*.cpp" "src/client/*.c" "src/client/*.h" "src/client/*.hpp")
+add_executable(client ${CLIENT_FILES})
+target_link_libraries(client common)
+target_include_directories(client PUBLIC src/client)
 
 # Add network files
 file(GLOB_RECURSE SERVER_FILES "src/server/*.cpp" "src/server/*.c" "src/server/*.h" "src/server/*.hpp")
