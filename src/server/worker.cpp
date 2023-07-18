@@ -545,6 +545,104 @@ namespace worker::server {
         client_ptr->add_message(std::make_shared<std::string>("The nick '" + nick + "' is now unmuted in the channel!"));
     }
 
+    void handle_mode(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to change its mode"));
+            return;
+        }
+
+        if (*client_ptr->channel->chop != *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be the channel operator to change the mode"));
+            return;
+        }
+        size_t mode_st = 0;
+        size_t mode_en = 0;
+
+        parse_msg_boundaries(message, mode_st, mode_en);
+
+        // Extract mode
+        std::string mode = std::string(message.substr(mode_st, mode_en));
+
+        // Validate nickname size
+        if (mode.size() < 2 || (mode[0] != '+' && mode[0] != '-') || (mode[1] != 'i')) {
+            client_ptr->add_message(std::make_shared<std::string>("Mode is invalid, should be in the format [+|-][i|s]"));
+            return;
+        }
+
+        bool addMode = mode[0] == '+';
+
+        {
+            auto guard = std::lock_guard<std::mutex>(client_ptr->channel->mutex);
+
+            // As of now the only mode flag is the invite only, no need to check it
+            if (addMode) {
+                client_ptr->channel->flags |= INVITE_ONLY;
+            } else {
+                client_ptr->channel->flags &= ~INVITE_ONLY;
+            }
+        }
+
+        if (addMode) {
+            client_ptr->add_message(std::make_shared<std::string>("The channel is now in invite only mode"));
+        } else {
+            client_ptr->add_message(std::make_shared<std::string>("The channel is now not in invite only mode"));
+        }
+    }
+
+    void handle_invite(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to invite someone"));
+            return;
+        }
+
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::string nick = message.substr(nick_st, nick_en);
+
+        // Validate nickname size
+        if (nick.empty() || nick.size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
+            return;
+        }
+
+        if (nick == *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You cant invite yourself"));
+            return;
+        }
+
+        // Add the target to the invites list
+        {
+            auto guard = std::lock_guard<std::mutex>(client_ptr->channel->mutex);
+            client_ptr->channel->invites.insert(nick);
+        }
+
+        client_ptr->add_message(std::make_shared<std::string>("The user has been invited"));
+
+        // Notify the target about the invite
+        std::shared_ptr<Client> target = nullptr;
+
+        // Retrieve the target user pointer
+        {
+            auto guard = std::lock_guard<std::mutex>(state->registered_clients_mutex);
+
+            auto it = state->registered_clients.find(nick);
+            if (it != state->registered_clients.end()) {
+                target = it->second;
+            }
+        }
+
+        // Check if the user is online and not in the same channel
+        if (target && target->channel != client_ptr->channel) {
+            target->add_message(std::make_shared<std::string>("You have been invited to the channel " + client_ptr->channel->name));
+            return;
+        }
+    }
+
+
     void handle_join(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
         if (!client_ptr->nickname) {
             client_ptr->add_message(
@@ -594,6 +692,7 @@ namespace worker::server {
                 channel->name = name;
                 channel->chop = client_ptr->nickname;
                 channel->members.insert(client_ptr);
+                channel->invites.insert(*client_ptr->nickname);
                 state->channels[name] = channel;
             }
         }
@@ -605,6 +704,12 @@ namespace worker::server {
             // Check if the user is allowed to join the channel
             if (channel->banned.find(*client_ptr->nickname) != channel->banned.end()) {
                 client_ptr->add_message(std::make_shared<std::string>("You are banned from this channel"));
+                return;
+            }
+
+            // Check for invite only channel
+            if ((channel->flags & INVITE_ONLY) != 0 && channel->invites.find(*client_ptr->nickname) == channel->invites.end()) {
+                client_ptr->add_message(std::make_shared<std::string>("You must be invited to this channel to join it"));
                 return;
             }
 
@@ -726,6 +831,16 @@ namespace worker::server {
 
         if (strncasecmp("/whois", message_cstr, 6) == 0 && (message.size() <= 6 || message[6] == ' ')) {
             handle_whois(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/mode", message_cstr, 5) == 0 && (message.size() <= 5 || message[5] == ' ')) {
+            handle_mode(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/invite", message_cstr, 7) == 0 && (message.size() <= 7 || message[7] == ' ')) {
+            handle_invite(message, client_ptr, state);
             return;
         }
 
