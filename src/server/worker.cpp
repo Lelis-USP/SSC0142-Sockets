@@ -1,10 +1,11 @@
+#include<iomanip>
 #include<iostream>
-#include<thread>
 #include<map>
 #include<mutex>
 #include<memory>
-#include<iomanip>
-#include<set>
+#include<thread>
+
+#include<strings.h>
 
 #include "../common/error.h"
 
@@ -12,15 +13,11 @@
 
 namespace worker::server {
 
-    /**
-     * Accept a new client collection using a non-blocking polling strategy
-     *
-     * @param state the application shared state pointer (holds data shared across threads)
-     * @param client_number the next client number (used for nickname generator)
-     * @return the new client's shared_ptr, can be a nullptr if failed to accept a new connection for any reason
-     */
-    std::shared_ptr<Client> accept_client(State *state, int client_number) {
+    ///////////////////////////
+    // Connection Management //
+    ///////////////////////////
 
+    std::shared_ptr<Client> accept_client(State *state) {
         // Accept a new connection on the server listener socket. Since the call is non-blocking, it will likely result
         // in a EAGAIN or EWOULDBLOCK error, which is mapped as conn.socket_fd = -2. In those cases, we should retry
         // accepting a connection after a small delay.
@@ -54,44 +51,31 @@ namespace worker::server {
             return nullptr;
         }
 
-        // We have successfully connected to a new client, let's compose it's data
-
-        // Build the client's nickname
-        std::stringstream nick_ss;
-        nick_ss << "client-" << client_number;
-
         // Build new client using a shared pointer (easier to manage memory)
         std::shared_ptr<Client> client_ptr = std::make_shared<Client>();
         client_ptr->connection = conn; // Client's connection data, include the socket fd
         client_ptr->ip_str = network::address_repr(conn.client_address); // Parse the client IP into a string
-        client_ptr->nickname = nick_ss.str(); // The client nickname
+        client_ptr->nickname = nullptr; // The client starts without an assigned nickname
         client_ptr->alive = true; // If the client is alive and happy :)
 
         // Return the shared pointer
         return client_ptr;
     }
 
-    /**
-     * Client manager thread runner. Checks for incoming connections and spin-up new listener for them.
-     * @param state the application shared state.
-     */
     void manager(State *state) {
         // If no state, exit
         if (state == nullptr) {
             return;
         }
 
-        // Client number for nickname generation
-        int client_number = 0;
-
         // Client threads (for later joining)
-        std::map<std::string, std::thread> threads;
+        std::map<std::shared_ptr<worker::server::Client>, std::thread> threads;
 
         // While the application should be alive, accept new clients
         while (!state->kill) {
 
             // Try accepting a new client
-            std::shared_ptr<Client> client_ptr = accept_client(state, ++client_number);
+            std::shared_ptr<Client> client_ptr = accept_client(state);
 
             // Check if a new client was successfully accepted
             if (!client_ptr) {
@@ -100,40 +84,33 @@ namespace worker::server {
                 break;
             }
 
-            std::cout << "New client from " << client_ptr->ip_str << " assigned nickname " << client_ptr->nickname
-                      << std::endl;
+            std::cout << "New client from " << client_ptr->ip_str << std::endl;
 
             // We have a new connection, register it to the clients map. Here we do guarded access to the map to avoid
             // any concurrency issues. The guard is destroyed after leaving the context, releasing the lock.
             {
                 auto guard = std::lock_guard<std::mutex>(state->clients_mutex);
-                state->clients[client_ptr->nickname] = client_ptr;
+                state->clients.insert(client_ptr);
 
                 // Cleanup dead clients
                 auto it = state->clients.begin();
                 while (it != state->clients.end()) {
-                    if (it->second->alive) {
+                    if ((*it)->alive) {
                         it++;
                         continue;
                     }
 
                     // Detach thread to avoid a thread leak
-                    threads[it->first].detach();
-                    threads.erase(it->first);
+                    threads[(*it)].detach();
+                    threads.erase((*it));
 
                     // Remove client from tracking list
                     it = state->clients.erase(it);
                 }
             }
 
-            // Here we can do one of two strategies: create a new thread for each client or have a separate thread
-            // handling the connection to every client. The first option, although heavier, should be easier to
-            // implement, so we'll follow with it!
-            // Update: a new strategy which could also be good is an alternating strategy (try receiving, then send) on
-            // each connections' thread alongside a message queue with the pending messages for that client. That way
-            // there is no chance of sync issues for the client.
-            // Maybe event keep a simple message index alongside a global message history?
-            threads.emplace(client_ptr->nickname, std::thread(communicator, client_ptr, state));
+            // Add the thread to the tracking map
+            threads.emplace(client_ptr, std::thread(communicator, client_ptr, state));
         }
 
         // The only we should reach here is if a kill signal was received, but let's ensure it anyway to prevent future
@@ -150,8 +127,7 @@ namespace worker::server {
         }
     }
 
-    void communicator(std::shared_ptr<Client> client_ptr, State *state) {
-
+    void communicator(const std::shared_ptr<Client> &client_ptr, State *state) {
         // Create a message buffer for receiving the client's messages. The +1 is to simplify conversion into a valid,
         // null-terminated, C-string :)
         char buffer[config::MAX_MESSAGE_SIZE + 1];
@@ -183,36 +159,11 @@ namespace worker::server {
         // Exit :)
     }
 
-    bool communicator_outgoing(std::shared_ptr<Client> client_ptr, State *state) {
-        while (!state->kill && client_ptr->alive && !client_ptr->message_queue.empty()) {
-            std::shared_ptr<std::string> message = client_ptr->message_queue.front();
+    //////////////////////
+    // Inbound Messages //
+    //////////////////////
 
-            // Send direct response to client
-            std::pair<const std::shared_ptr<Client>, int> client_info = std::make_pair(client_ptr, 0);
-
-            // Try sending message until max tries reached
-            while (try_send_message(*message, client_info)) {
-                // Should be dead, skip
-                if (state->kill || !client_ptr->alive) {
-                    return true;
-                }
-
-                // Delay
-                std::this_thread::sleep_for(config::POLLING_INTERVAL);
-            }
-
-            // Remove message from the queue
-            {
-                // Acquire message queue lock
-                auto guard = std::lock_guard<std::mutex>(client_ptr->message_queue_mutex);
-                // Pop front message
-                client_ptr->message_queue.pop();
-            }
-        }
-        return false;
-    }
-
-    bool communicator_incoming(std::shared_ptr<Client> client_ptr, State *state, char buffer[]) {
+    bool communicator_incoming(const std::shared_ptr<Client> &client_ptr, State *state, char buffer[]) {
         // Try reading the next message from the client in a non-blocking way. If there is no message available, or
         // a timeout is triggered, a EAGAIN or EWOULDBLOCK error will happen, resulting in a -2 return.
         int result = network::read_message(client_ptr->connection.socket_fd, buffer);
@@ -231,7 +182,7 @@ namespace worker::server {
 
         // Check for a closed connection from the client
         if (result == 0) {
-            error::warning("The client with nickname " + client_ptr->nickname + " has ended its connection!");
+            error::warning("The client with ip " + client_ptr->ip_str + " has ended its connection!");
             client_ptr->alive = false;
             return true;
         }
@@ -242,8 +193,53 @@ namespace worker::server {
         std::string message = buffer;
 
         // Do something with the message, not my problem...
-        handle_message(message, client_ptr, state);
+        handle(message, client_ptr, state);
         return false;
+    }
+
+    ///////////////////////
+    // Outbound Messages //
+    ///////////////////////
+
+    bool communicator_outgoing(const std::shared_ptr<Client> &client_ptr, State *state) {
+        while (!state->kill && client_ptr->alive) {
+            std::shared_ptr<std::string> message = client_ptr->pop_message();
+
+            if (!message) {
+                return false;
+            }
+
+            // Send direct response to client
+            std::pair<const std::shared_ptr<Client>, int> client_info = std::make_pair(client_ptr, 0);
+
+            // Try sending message until max tries reached
+            while (try_send_message(*message, client_info)) {
+                // Should be dead, skip
+                if (state->kill || !client_ptr->alive) {
+                    return true;
+                }
+
+                // Delay
+                std::this_thread::sleep_for(config::POLLING_INTERVAL);
+            }
+        }
+        return false;
+    }
+
+    void broadcast_message_channel(const std::string &message, const std::shared_ptr<Channel> &channel) {
+        // Build a shared pointer to a copy of the message to avoid duplicating the message for each client which will
+        // receive it.
+        std::shared_ptr<std::string> message_ptr = std::make_shared<std::string>(message);
+
+        for (const auto &entry: channel->members) {
+            // Skip dead clients
+            if (!entry->alive) {
+                continue;
+            }
+
+            // Add the message to the queue of the current client
+            entry->add_message(message_ptr);
+        }
     }
 
     bool try_send_message(const std::string &message, std::pair<const std::shared_ptr<Client>, int> &client_info) {
@@ -285,76 +281,481 @@ namespace worker::server {
         return false;
     }
 
-    void handle_message(const std::string &message, std::shared_ptr<Client> client_ptr, State *state) {
-        // Check if it's a normal message, if it is, concatenate the client nickname and broadcast it
-        if (message[0] != '/') {
-            // Size of the nickname prefix
-            size_t prefix_len = client_ptr->nickname.size() + 2;
+    //////////////////////
+    // Message Handling //
+    //////////////////////
 
-            if (message.size() + prefix_len <= config::MAX_MESSAGE_SIZE) {
-                // Broadcast message to every client
-                broadcast_message(client_ptr->nickname + ": " + message, state);
-            } else {
-                // Split the message into two
-                size_t cut_idx = config::MAX_MESSAGE_SIZE - prefix_len;
-                std::string left_str = client_ptr->nickname + ": " + message.substr(0, cut_idx);
-                std::string right_str = client_ptr->nickname + ": " + message.substr(cut_idx, message.size());
+    // Validation //
 
-                // Send both messages
-                broadcast_message(left_str, state);
-                broadcast_message(right_str, state);
+    bool is_nickname_allowed(char c) {
+        return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' || c == '_' ||
+               c == '.';
+    }
+
+    // Parsing //
+
+    void parse_msg_boundaries(const std::string &message, size_t &start, size_t &end) {
+        start = 0;
+        end = 0;
+
+        for (size_t i = 1; i < message.size(); i++) {
+            if (message[i] != ' ' && message[i - 1] == ' ') {
+                if (start == 0) {
+                    start = i;
+                    continue;
+                }
             }
 
+            if (start != 0 && message[i] == ' ') {
+                end = i;
+            }
+        }
+
+        if (end == 0) {
+            end = message.size();
+        }
+    }
+
+    // Handlers //
+
+    void handle_nick(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::shared_ptr<std::string> nick = std::make_shared<std::string>(message.substr(nick_st, nick_en));
+
+        // Validate nickname size
+        if (nick->empty() || nick->size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
             return;
         }
 
-        // Handle each command
-        if (message == "/quit") {
+        // Validate nickname content
+        for (const auto &c: *nick) {
+            if (!is_nickname_allowed(c)) {
+                client_ptr->add_message(std::make_shared<std::string>("Nickname not allowed"));
+                return;
+            }
+        }
+
+        bool failure = false;
+
+        {
+            auto guard = std::lock_guard<std::mutex>(state->registered_clients_mutex);
+
+            // Removal failure
+            if (state->registered_clients.find(*nick) != state->registered_clients.end()) {
+                failure = true;
+            } else {
+                // Remove previous nick
+                if (client_ptr->nickname) {
+                    state->registered_clients.erase(*client_ptr->nickname);
+                }
+
+                // Register client
+                state->registered_clients[*nick] = client_ptr;
+                client_ptr->nickname = nick;
+            }
+        }
+
+        if (failure) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname not available"));
+            return;
+        }
+
+        client_ptr->add_message(std::make_shared<std::string>("Nickname updated"));
+    }
+
+    void handle_kick(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to kick someone"));
+            return;
+        }
+
+        if (*client_ptr->channel->chop != *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be the channel operator to kick someone"));
+            return;
+        }
+
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::string nick = message.substr(nick_st, nick_en);
+
+        // Validate nickname size
+        if (nick.empty() || nick.size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
+            return;
+        }
+
+        if (nick == *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You cant kick yourself"));
+            return;
+        }
+
+        std::shared_ptr<Client> target = nullptr;
+
+        // Retrieve the target user pointer
+        {
+            auto guard = std::lock_guard<std::mutex>(state->registered_clients_mutex);
+
+            auto it = state->registered_clients.find(nick);
+            if (it != state->registered_clients.end()) {
+                target = it->second;
+            }
+        }
+
+        // Check if the user was found in the same channel
+        if (!target || target->channel != client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("The user is not present"));
+            return;
+        }
+
+        // Remove the target from the members list
+        {
+            auto guard = std::lock_guard<std::mutex>(target->channel->mutex);
+
+            // Remove target from members list
+            target->channel->members.erase(target);
+        }
+
+        target->channel = nullptr;
+        target->add_message(std::make_shared<std::string>("You were kicked from the channel"));
+    }
+
+    void handle_whois(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to whois someone"));
+            return;
+        }
+
+        if (*client_ptr->channel->chop != *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be the channel operator to whois someone"));
+            return;
+        }
+
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::string nick = message.substr(nick_st, nick_en);
+
+        // Validate nickname size
+        if (nick.empty() || nick.size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
+            return;
+        }
+
+        std::shared_ptr<Client> target = nullptr;
+
+        // Retrieve the target user pointer
+        {
+            auto guard = std::lock_guard<std::mutex>(state->registered_clients_mutex);
+
+            auto it = state->registered_clients.find(nick);
+            if (it != state->registered_clients.end()) {
+                target = it->second;
+            }
+        }
+
+        // Check if the user was found in the same channel
+        if (!target || target->channel != client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("The user is not present"));
+            return;
+        }
+
+        client_ptr->add_message(std::make_shared<std::string>(target->ip_str));
+    }
+
+    void handle_mute(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to mute someone"));
+            return;
+        }
+
+        if (*client_ptr->channel->chop != *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be the channel operator to mute someone"));
+            return;
+        }
+
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::string nick = message.substr(nick_st, nick_en);
+
+        // Validate nickname size
+        if (nick.empty() || nick.size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
+            return;
+        }
+
+        // Add the nick to the muted list
+        {
+            auto guard = std::lock_guard<std::mutex>(client_ptr->channel->mutex);
+            client_ptr->channel->muted.insert(nick);
+        }
+
+        // Success message
+        client_ptr->add_message(std::make_shared<std::string>("The nick '" + nick + "' is now muted in the channel!"));
+    }
+
+    void handle_unmute(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->channel) {
+            client_ptr->add_message(std::make_shared<std::string>("You must be in a channel to unmute someone"));
+            return;
+        }
+
+        if (*client_ptr->channel->chop != *client_ptr->nickname) {
+            client_ptr->add_message(std::make_shared<std::string>("You must bethe channel operator to unmute someone"));
+            return;
+        }
+
+        size_t nick_st = 0;
+        size_t nick_en = 0;
+
+        parse_msg_boundaries(message, nick_st, nick_en);
+
+        // Extract nickname
+        std::string nick = message.substr(nick_st, nick_en);
+
+        // Validate nickname size
+        if (nick.empty() || nick.size() > 50) {
+            client_ptr->add_message(std::make_shared<std::string>("Nickname size is invalid"));
+            return;
+        }
+
+        // Remove the nick from the muted list
+        {
+            auto guard = std::lock_guard<std::mutex>(client_ptr->channel->mutex);
+            client_ptr->channel->muted.erase(nick);
+        }
+
+        // Success message
+        client_ptr->add_message(std::make_shared<std::string>("The nick '" + nick + "' is now unmuted in the channel!"));
+    }
+
+    void handle_join(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        if (!client_ptr->nickname) {
+            client_ptr->add_message(
+                    std::make_shared<std::string>("Identify yourself using /nick to be able to join a channel"));
+            return;
+        }
+
+        size_t name_st = 0;
+        size_t name_en = 0;
+
+        parse_msg_boundaries(message, name_st, name_en);
+
+        // Extract name
+        std::string name = message.substr(name_st, name_en);
+
+        // Check size constraint
+        if (name.empty() || name.size() > 200) {
+            client_ptr->add_message(std::make_shared<std::string>("Channel name size is invalid"));
+            return;
+        }
+
+        // Check initial character constraint
+        if (name[0] != '#' && name[0] != '&') {
+            client_ptr->add_message(std::make_shared<std::string>("Channels must start with either # or &"));
+            return;
+        }
+
+        // Validate that only allowed chars are present
+        for (const auto &c: name) {
+            if (c == ',' || c == 7 || c == ' ') {
+                client_ptr->add_message(std::make_shared<std::string>("Channel name is not allowed"));
+                return;
+            }
+        }
+
+        std::shared_ptr<Channel> channel;
+
+        // Acquire channels lock and retrieve/create the channel
+        {
+            auto guard = std::lock_guard<std::mutex>(state->channels_mutex);
+
+            auto channel_it = state->channels.find(name);
+            if (channel_it != state->channels.end()) {
+                channel = channel_it->second;
+            } else {
+                channel = std::make_shared<Channel>();
+                channel->name = name;
+                channel->chop = client_ptr->nickname;
+                channel->members.insert(client_ptr);
+                state->channels[name] = channel;
+            }
+        }
+
+        // Acquire the channel's mutex and join it
+        {
+            auto guard = std::lock_guard<std::mutex>(channel->mutex);
+
+            // Check if the user is allowed to join the channel
+            if (channel->banned.find(*client_ptr->nickname) != channel->banned.end()) {
+                client_ptr->add_message(std::make_shared<std::string>("You are banned from this channel"));
+                return;
+            }
+
+            // Add self to members list
+            channel->members.insert(client_ptr);
+        }
+
+        // Leave any old channel
+        if (client_ptr->channel) {
+            auto guard = std::lock_guard<std::mutex>(client_ptr->channel->mutex);
+
+            // Remove self from members list
+            client_ptr->channel->members.erase(client_ptr);
+
+            // If channel is empty, kill it
+            if (client_ptr->channel->members.empty()) {
+                auto guard2 = std::lock_guard<std::mutex>(state->channels_mutex);
+
+                state->channels.erase(client_ptr->channel->name);
+            }
+        }
+
+        // Update active channel
+        client_ptr->channel = channel;
+        client_ptr->add_message(std::make_shared<std::string>("Joined the channel!"));
+    }
+
+    void handle_text(const std::string &message, const std::shared_ptr<Client> &client_ptr) {
+        if (!client_ptr->nickname) {
+            client_ptr->add_message(
+                    std::make_shared<std::string>("Identify yourself using /nick to be able to send a message"));
+            return;
+        }
+
+        if (!client_ptr->channel) {
+            client_ptr->add_message(
+                    std::make_shared<std::string>("You must join a channel using /join to send a message"));
+            return;
+        }
+
+        // Check if the client is muted in the channel
+        if (client_ptr->channel->muted.find(*client_ptr->nickname) != client_ptr->channel->muted.end()) {
+            client_ptr->add_message(
+                    std::make_shared<std::string>("You are muted in this channel!"));
+            return;
+        }
+
+        // Size of the nickname prefix
+        size_t prefix_len = client_ptr->nickname->size() + 2;
+
+        if (message.size() + prefix_len <= config::MAX_MESSAGE_SIZE) {
+            // Broadcast message to every client
+            broadcast_message_channel((*client_ptr->nickname) + ": " + message, client_ptr->channel);
+        } else {
+            // Split the message into two
+            size_t cut_idx = config::MAX_MESSAGE_SIZE - prefix_len;
+            std::string left_str = (*client_ptr->nickname) + ": " + message.substr(0, cut_idx);
+            std::string right_str = (*client_ptr->nickname) + ": " + message.substr(cut_idx, message.size());
+
+            // Send both messages
+            broadcast_message_channel(left_str, client_ptr->channel);
+            broadcast_message_channel(right_str, client_ptr->channel);
+        }
+    }
+
+    // Message Entrypoint //
+
+    void handle(const std::string &message, const std::shared_ptr<Client> &client_ptr, State *state) {
+        // Check if it's a normal message, if it is, concatenate the client nickname and broadcast it
+        if (message[0] != '/') {
+            handle_text(message, client_ptr);
+            return;
+        }
+
+        auto message_cstr = message.c_str();
+
+        // Handle quit command
+        if (strcasecmp("/quit", message_cstr) == 0) {
             client_ptr->alive = false;
             return;
         }
 
-        // Command response text
-        std::string response = "unknown command";
-
-        // Connect command
-        if (message == "/connect") {
-            response = "already connected";
+        // Handle connect command
+        if (strcasecmp("/connect", message_cstr) == 0) {
+            client_ptr->add_message(std::make_shared<std::string>("Already connected!"));
+            return;
         }
 
-        // Ping command
-        if (message == "/ping") {
-            response = "pong";
+        // Handle the ping command
+        if (strcasecmp("/ping", message_cstr) == 0) {
+            client_ptr->add_message(std::make_shared<std::string>("pong"));
+            return;
         }
 
-        // Send direct response to client
-        std::pair<const std::shared_ptr<Client>, int> client_info = std::make_pair(client_ptr, 0);
-
-        // Try sending message until max tries reached
-        while (try_send_message(response, client_info)) {
-            std::this_thread::sleep_for(config::POLLING_INTERVAL);
+        if (strncasecmp("/nick", message_cstr, 5) == 0 && (message.size() <= 5 || message[5] == ' ')) {
+            handle_nick(message, client_ptr, state);
+            return;
         }
+
+        if (strncasecmp("/join", message_cstr, 5) == 0 && (message.size() <= 5 || message[5] == ' ')) {
+            handle_join(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/kick", message_cstr, 5) == 0 && (message.size() <= 5 || message[5] == ' ')) {
+            handle_kick(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/mute", message_cstr, 5) == 0 && (message.size() <= 5 || message[5] == ' ')) {
+            handle_mute(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/unmute", message_cstr, 7) == 0 && (message.size() <= 7 || message[7] == ' ')) {
+            handle_unmute(message, client_ptr, state);
+            return;
+        }
+
+        if (strncasecmp("/whois", message_cstr, 6) == 0 && (message.size() <= 6 || message[6] == ' ')) {
+            handle_whois(message, client_ptr, state);
+            return;
+        }
+
+        // Unknown command
+        client_ptr->add_message(std::make_shared<std::string>("Unknown command!"));
     }
 
+    /////////////////////////////////////
+    // Client message queue management //
+    /////////////////////////////////////
 
-    void broadcast_message(const std::string &message, State *state) {
-        // Build a shared pointer to a copy of the message to avoid duplicating the message for each client which will
-        // receive it.
-        std::shared_ptr<std::string> message_ptr = std::make_shared<std::string>(message);
+    void Client::add_message(const std::shared_ptr<std::string> &message) {
+        // Prevent concurrency while modifying the client's message queue
+        auto guard = std::lock_guard<std::mutex>(this->message_queue_mutex);
+        // Add the new message to the end of the message queue
+        this->message_queue.push(message);
+    }
 
-        for (const auto &entry: state->clients) {
-            // Skip dead clients
-            if (!entry.second->alive) {
-                continue;
-            }
+    std::shared_ptr<std::string> Client::pop_message() {
+        // Prevent concurrency while modifying the client's message queue
+        auto guard = std::lock_guard<std::mutex>(this->message_queue_mutex);
 
-            // Prevent concurrent access to the message queue
-            {
-                // Acquire message queue lock
-                auto guard = std::lock_guard<std::mutex>(entry.second->message_queue_mutex);
-                // Add message to the queue
-                entry.second->message_queue.push(message_ptr);
-            }
+        // If the queue is empty, return a null pointer
+        if (this->message_queue.empty()) {
+            return nullptr;
         }
+
+        // Get the front element and remove it from the queue
+        auto data = this->message_queue.front();
+        this->message_queue.pop();
+        return data;
     }
 }
