@@ -12,15 +12,15 @@ namespace config {
     static const std::string DEFAULT_HOST = "127.0.0.1";
     static const std::uint16_t DEFAULT_PORT = 60332;
 
-    // 1s listen timeout
+    // 5s listen timeout
     static const struct timeval TCP_RECEIVE_TIMEOUT = {
-            .tv_sec = 1,
+            .tv_sec = 5,
             .tv_usec = 0,
     };
 
-    // 1s send timeout
+    // 5s send timeout
     static const struct timeval TCP_SEND_TIMEOUT = {
-            .tv_sec = 1,
+            .tv_sec = 5,
             .tv_usec = 0,
     };
 

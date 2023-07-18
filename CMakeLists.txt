@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.25)
 project(TP2_Redes)
 
 set(CMAKE_CXX_STANDARD 17)
-add_compile_options(-fsanitize=address -g)
-add_link_options(-fsanitize=address -g)
+add_compile_options(-O2)
+add_link_options(-static-libgcc -static-libstdc++ -static)
 
 
 # Add config files

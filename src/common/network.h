@@ -12,11 +12,6 @@ namespace network {
         int socket_fd;
     } Connection;
 
-    // Configure socket timeout
-    int configure_socket(int socket_fd);
-
-    int configure_blocking(int socket_fd, bool blocking);
-
     // Create, configure and bind a listening socket following the given network config
     int listen(config::ConnectionConfig config);
 

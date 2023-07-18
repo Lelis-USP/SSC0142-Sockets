@@ -13,7 +13,7 @@
 #include "network.h"
 
 namespace network {
-    int configure_socket(int socket_fd) {
+    int configure_non_blocking(int socket_fd) {
         // Configure socket to non-blocking mode
         int flags = fcntl(socket_fd, F_GETFL, 0);
         if (fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
@@ -21,6 +21,10 @@ namespace network {
             return -1;
         }
 
+        return 0;
+    }
+
+    int configure_timeout(int socket_fd) {
         // Configure receiving timeout
         if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &config::TCP_RECEIVE_TIMEOUT,
                        sizeof(config::TCP_RECEIVE_TIMEOUT)) < 0) {
@@ -47,8 +51,8 @@ namespace network {
             return -1;
         }
 
-        // Configure socket timeout & blocking mode
-        if (configure_socket(socket_fd) != 0) {
+        // Configure socket timeout
+        if (configure_timeout(socket_fd) != 0) {
             return -1;
         }
 
@@ -71,6 +75,11 @@ namespace network {
             return -1;
         }
 
+        // Make socket non-blocking
+        if (configure_non_blocking(socket_fd) != 0) {
+            return -1;
+        }
+
         std::cout << "Server listening at " << config.host << ":" << config.port << std::endl;
         return socket_fd;
     }
@@ -80,6 +89,11 @@ namespace network {
         // Create an IPv4 TCP socket
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd < 0) { // Check if a file descriptor was allocated
+            return -1;
+        }
+
+        // Configure socket timeout
+        if (configure_timeout(socket_fd) != 0) {
             return -1;
         }
 
@@ -95,9 +109,8 @@ namespace network {
             return -1;
         }
 
-        // Configure socket timeout & blocking mode. Executing after the connect prevents handling async connect and the
-        // errno EINPROGRESS.
-        if (configure_socket(socket_fd) != 0) {
+        // Make socket non-blocking
+        if (configure_non_blocking(socket_fd) != 0) {
             return -1;
         }
 
@@ -127,7 +140,7 @@ namespace network {
         }
 
         // Configure socket timeout & blocking mode
-        if (configure_socket(conn_fd) != 0) {
+        if (configure_timeout(conn_fd) != 0 || configure_non_blocking(conn_fd) != 0) {
             new_conn.socket_fd = -1;
             return new_conn;
         }
