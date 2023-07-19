@@ -1,5 +1,7 @@
 # SSC0142 - Sockets
 
+Vídeo: [Google Drive](https://drive.google.com/file/d/1BXir8GyO-WdFA-DixngbRZ-pYPUC_MZa/view?usp=sharing)
+
 ## Membros
 
 - Daniel H. Lelis - 12543822
